@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="BAC Monitor"/>
+  <title>성재 BAC Monitor</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+    body{background:#0a0c0a;overscroll-behavior:none;}
+    button{cursor:pointer;font-family:'Noto Sans KR',sans-serif;}
+    button:active{opacity:.75;}
+    input[type=range]{width:100%;accent-color:#7ec8a4;margin:8px 0;}
+    input[type=number]{-moz-appearance:textfield;font-family:'JetBrains Mono',monospace;}
+    input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none;}
+    textarea{resize:none;outline:none;font-family:'Noto Sans KR',sans-serif;}
+    @keyframes fu{from{opacity:0;transform:translateX(-50%) translateY(8px);}to{opacity:1;transform:translateX(-50%) translateY(0);}}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ══════════════════════════════════════════════════
+// 과학 상수
+// ══════════════════════════════════════════════════
+const R = { male: 0.68, female: 0.55 };
+const METABOLISM = 0.015;
+const EMPTY_FACTOR = 1.25;
+
+const DRINKS = [
+  { id:"beer",  label:"맥주",   emoji:"🍺", g:14, ml:350 },
+  { id:"soju",  label:"소주",   emoji:"🥃", g:8,  ml:50  },
+  { id:"wine",  label:"와인",   emoji:"🍷", g:14, ml:150 },
+  { id:"makk",  label:"막걸리", emoji:"🍶", g:11, ml:200 },
+  { id:"whis",  label:"위스키", emoji:"🥃", g:13, ml:40  },
+];
+
+const STAGES = [
+  { max:0.02, lv:0, col:"#7ec8a4", label:"맑음" },
+  { max:0.05, lv:1, col:"#a8d882", label:"이완" },
+  { max:0.08, lv:2, col:"#e8c44a", label:"⚠️ 경고" },
+  { max:0.10, lv:3, col:"#e8944a", label:"🚨 위험" },
+  { max:99,   lv:4, col:"#e05c5c", label:"💀 블랙아웃" },
+];
+
+function getStage(bac) { return STAGES.find(s => bac < s.max) || STAGES[4]; }
+
+function condFactor(cond) {
+  if (!cond) return 1.0;
+  let f = 1.0;
+  const sl = cond.sleep ?? 8;
+  if (sl <= 4)      f *= 1.20;
+  else if (sl <= 6) f *= 1.10;
+  const st = cond.stress ?? 1;
+  if (st >= 4)      f *= 1.10;
+  else if (st >= 3) f *= 1.05;
+  if (cond.dehydrated) f *= 1.15;
+  if (cond.sick)       f *= 1.15;
+  return parseFloat(f.toFixed(3));
+}
+
+function calcBAC(log, profile, nowTs, empty, cf = 1.0) {
+  const r = R[profile.gender];
+  const f = (empty ? EMPTY_FACTOR : 1.0) * cf;
+  return Math.max(0, log.reduce((tot, e) => {
+    const elH  = Math.max(0, (nowTs - e.time) / 3600000);
+    const absH = Math.max(0, elH - 0.3);
+    const peak = (e.g * 100 * f) / (profile.weight * r * 1000);
+    return tot + Math.max(0, peak - METABOLISM * absH);
+  }, 0));
+}
+
+function buildInsights(recs) {
+  const reviewed = Object.values(recs).filter(r => r.review && r.maxBac > 0);
+  if (reviewed.length < 3) return { count: reviewed.length, ready: false };
+  const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : null;
+  const byBac = (lo, hi) => reviewed.filter(r => r.maxBac>=lo && r.maxBac<hi).map(r=>r.review.hangover);
+  return {
+    count: reviewed.length, ready: true,
+    avgLow:  avg(byBac(0, 0.05)),
+    avgMid:  avg(byBac(0.05, 0.08)),
+    avgHigh: avg(byBac(0.08, 99)),
+    headacheRate: Math.round(reviewed.filter(r=>r.review.headache).length/reviewed.length*100),
+    regretRate:   Math.round(reviewed.filter(r=>r.review.regret).length/reviewed.length*100),
+    emptyAvg: avg(reviewed.filter(r=>r.empty).map(r=>r.review.hangover)),
+    fullAvg:  avg(reviewed.filter(r=>!r.empty).map(r=>r.review.hangover)),
+    memAvg:   avg(reviewed.map(r=>r.review.memory)),
+  };
+}
+
+function predictNextDay(maxBac, totalG, empty, ins) {
+  const out = [];
+  if (ins?.ready) {
+    const rel = maxBac < 0.05 ? ins.avgLow : maxBac < 0.08 ? ins.avgMid : ins.avgHigh;
+    if (rel !== null) {
+      const s = rel>=4?4:rel>=3?3:rel>=2?2:rel>=1?1:0;
+      out.push({ icon:s>=3?"🤢":s>=2?"🤕":"🙂", t:`숙취 예상 ${rel.toFixed(1)}/5점`, d:`성재 ${ins.count}회 데이터 기반`, s });
+    }
+    if (ins.headacheRate > 0) out.push({ icon:"🤕", t:`두통 확률 ${ins.headacheRate}%`, d:"성재 기록 기반 실측치", s:ins.headacheRate>60?3:2 });
+    if (ins.regretRate > 30)  out.push({ icon:"😔", t:`후회 확률 ${ins.regretRate}%`, d:`마신 날 중 ${ins.regretRate}%에서 후회했어`, s:2 });
+    if (empty && ins.emptyAvg!==null && ins.fullAvg!==null) {
+      const diff = (ins.emptyAvg - ins.fullAvg).toFixed(1);
+      if (parseFloat(diff) > 0.2) out.push({ icon:"⚡", t:`공복 숙취 +${diff}점`, d:"공복으로 마신 날 숙취 더 심해", s:2 });
+    }
+    if (ins.memAvg!==null && ins.memAvg<7) out.push({ icon:"🧠", t:`기억 선명도 평균 ${ins.memAvg.toFixed(1)}/10`, d:"마신 날 기억이 평균 이 정도만 남아", s:ins.memAvg<5?3:2 });
+  } else {
+    const lv = maxBac<0.02?0:maxBac<0.05?1:maxBac<0.08?2:maxBac<0.10?3:4;
+    const labels = ["숙취 없음","가벼운 피로","두통 + 피로","심한 숙취","극심한 숙취"];
+    const descs  = ["다음날 컨디션 100%.","약간 처질 수 있음.","두통, 집중력 저하.","두통·메스꺼움. 업무 집중 어려움.","구토, 극심한 두통."];
+    out.push({ icon:lv>=3?"🤢":lv>=2?"🤕":"🙂", t:labels[lv], d:descs[lv]+` (후기 ${Math.max(0,3-(ins?.count||0))}개 더 쌓이면 성재 기준으로 바뀌어)`, s:lv });
+  }
+  if (maxBac >= 0.10) out.push({ icon:"💀", t:"블랙아웃 가능", d:"후기 꼭 남겨줘.", s:4 });
+  out.push({ icon:"🫀", t:`간 회복 약 ${Math.ceil(totalG/8)}시간`, d:`순알코올 ${totalG}g 기준.`, s:1 });
+  out.push({ icon:"💧", t:`물 ${Math.round(totalG*10+300)}ml 마셔`, d:"지금 당장 마시기 시작해.", s:1 });
+  return out;
+}
+
+function speak(txt) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(txt);
+  u.lang="ko-KR"; u.rate=0.93; u.volume=1;
+  window.speechSynthesis.speak(u);
+}
+function voiceMsg(bac, stage, cnt, is2nd, cf) {
+  const b = (bac*1000).toFixed(1), sh = Math.ceil(bac/METABOLISM);
+  const warn = cf > 1.1 ? ` 오늘 컨디션 안 좋아서 실제로 더 많이 취한 상태야.` : "";
+  if (stage.lv>=4) return `성재야 그만. 혈중 알코올 ${b}밀리그램. 블랙아웃 구간이야.${warn} 당장 멈춰.`;
+  if (stage.lv===3) return `성재야 위험해. 혈중 알코올 ${b}밀리그램.${warn} 지금 멈추면 블랙아웃 없어. 완전히 깨려면 ${sh}시간 걸려.`;
+  if (stage.lv===2) return `성재야 슬슬 올라오고 있어. ${cnt}잔, 혈중 알코올 ${b}밀리그램.${is2nd?" 2차 왔으면 이제 마지막이야.":" 물 한 잔 마셔."}`;
+  return `지금 ${cnt}잔. 혈중 알코올 ${b}밀리그램. 아직 괜찮아.`;
+}
+
+const DAY = ["일","월","화","수","목","금","토"];
+function getToday()     { return new Date().toISOString().split("T")[0]; }
+function getYesterday() { const d=new Date(); d.setDate(d.getDate()-1); return d.toISOString().split("T")[0]; }
+function getWeek()      { return Array.from({length:7},(_,i)=>{ const d=new Date(); d.setDate(d.getDate()-(6-i)); return d.toISOString().split("T")[0]; }); }
+function fmtMs(ms)      { const m=Math.floor(ms/60000); return m<60?`${m}분`:`${Math.floor(m/60)}시간 ${m%60}분`; }
+function fmtSober(h) {
+  if (h<=0) return "이미 맑음";
+  const d=new Date(); d.setMinutes(d.getMinutes()+Math.round(h*60));
+  const hh=d.getHours(), mm=String(d.getMinutes()).padStart(2,"0");
+  return `약 ${Math.floor(h)}시간 후 (${hh<12?"오전":"오후"} ${hh%12||12}:${mm})`;
+}
+
+const INIT_REVIEW = { hangover:0, headache:false, nausea:false, memory:10, focus:10, regret:false, memo:"" };
+const INIT_COND   = { sleep:8, stress:1, dehydrated:false, sick:false };
+
+const S = {
+  root:     {fontFamily:"'Noto Sans KR',sans-serif",background:"#0a0c0a",minHeight:"100vh",color:"#e8e6df",maxWidth:430,margin:"0 auto",position:"relative",overflow:"hidden"},
+  orb:      {position:"fixed",top:-100,right:-80,width:380,height:380,borderRadius:"50%",pointerEvents:"none",zIndex:0},
+  pg:       {position:"relative",zIndex:1,padding:"22px 18px 110px"},
+  hdr:      {display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12},
+  hdrT:     {fontSize:15,fontWeight:700},
+  hdrS:     {fontSize:11,color:"#6b7280",marginTop:2},
+  iconBtn:  {background:"transparent",border:"1px solid",borderRadius:10,padding:"6px 10px",fontSize:16},
+  condBanner:{width:"100%",border:"1px solid",borderRadius:14,padding:"11px 14px",marginBottom:12,display:"flex",alignItems:"center",gap:10,cursor:"pointer"},
+  condSec:  {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:16,padding:"14px 16px",marginBottom:12},
+  condLabel:{fontSize:12,color:"#9ca3af",fontWeight:600,marginBottom:6},
+  condWarnTxt:{fontSize:10,color:"#e8944a",marginTop:6},
+  reviewNudge:{width:"100%",background:"rgba(167,139,250,0.08)",border:"1px solid rgba(167,139,250,0.3)",borderRadius:14,padding:"12px 14px",marginBottom:12,display:"flex",alignItems:"center",gap:12,cursor:"pointer"},
+  tolBanner:{border:"1px solid #e8c44a44",borderRadius:12,padding:"10px 12px",marginBottom:12,display:"flex",gap:10,alignItems:"flex-start",background:"rgba(232,196,74,0.07)"},
+  profCard: {background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:14,padding:"14px",marginBottom:12},
+  pLab:     {fontSize:10,color:"#6b7280",marginBottom:5,marginTop:8},
+  pInput:   {width:"100%",background:"rgba(255,255,255,0.07)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:8,padding:"7px 10px",color:"#fff",fontSize:14},
+  gBtn:     {flex:1,border:"1px solid",borderRadius:8,padding:"7px",fontSize:13,fontWeight:600,background:"transparent"},
+  habitBanner:{border:"1px solid",borderRadius:12,padding:"12px 14px",marginBottom:12,display:"flex",gap:10,alignItems:"flex-start"},
+  bacCard:  {border:"1px solid",borderRadius:22,padding:"18px 18px 16px",marginBottom:12},
+  stageBadge:{border:"1px solid",borderRadius:12,padding:"4px 10px",fontSize:11,fontWeight:700},
+  iBox:     {flex:1,background:"rgba(255,255,255,0.04)",borderRadius:10,padding:"10px 8px",textAlign:"center",border:"1px solid rgba(255,255,255,0.06)"},
+  predCard: {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:18,padding:"16px",marginBottom:12},
+  voiceBtn: {background:"transparent",border:"1px solid",borderRadius:12,padding:"11px",fontSize:13,fontWeight:600},
+  stopBtn:  {width:"100%",border:"1.5px solid",borderRadius:14,fontWeight:700,marginBottom:12,transition:"all 0.3s",background:"transparent"},
+  stoppedBox:{border:"1px solid rgba(126,200,164,0.3)",borderRadius:14,padding:"14px 18px",marginBottom:12,display:"flex",alignItems:"center",gap:12,background:"rgba(126,200,164,0.07)"},
+  secLab:   {fontSize:10,color:"#6b7280",letterSpacing:1.5,textTransform:"uppercase",marginBottom:10},
+  dGrid:    {display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:7,marginBottom:8},
+  dBtn:     {background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:13,padding:"11px 3px",display:"flex",flexDirection:"column",alignItems:"center",gap:2},
+  undoBtn:  {width:"100%",background:"transparent",border:"1px solid rgba(255,255,255,0.07)",color:"#6b7280",borderRadius:12,padding:"9px",fontSize:12,marginBottom:12},
+  tlRow:    {display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:"rgba(255,255,255,0.03)",borderRadius:10,border:"1px solid rgba(255,255,255,0.05)",marginBottom:5},
+  checkCard:{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:14,padding:"14px",marginBottom:12},
+  checkBtn: {flex:1,background:"transparent",border:"1px solid",borderRadius:10,padding:"10px",fontSize:13,fontWeight:600,transition:"all 0.2s"},
+  weekRow:  {display:"flex",gap:5,justifyContent:"center",marginTop:4},
+  dot:      {borderRadius:10,padding:"6px 7px",textAlign:"center",minWidth:37,background:"transparent",border:"2px solid transparent"},
+  pgT:      {fontSize:17,fontWeight:700,marginBottom:18},
+  statRow:  {display:"flex",gap:10,marginBottom:16},
+  sBox:     {flex:1,background:"rgba(255,255,255,0.04)",borderRadius:14,padding:"14px 10px",textAlign:"center",border:"1px solid rgba(255,255,255,0.06)"},
+  calRow:   {borderRadius:14,padding:"12px 14px",marginBottom:9,display:"flex",alignItems:"center",gap:10},
+  achBox:   {background:"rgba(255,255,255,0.04)",borderRadius:20,padding:22,border:"1px solid rgba(255,255,255,0.06)",marginTop:12},
+  insCard:  {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:18,padding:"16px",marginBottom:12},
+  revSec:   {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:16,padding:"14px 16px",marginBottom:12},
+  revLabel: {fontSize:11,color:"#6b7280",fontWeight:600,letterSpacing:0.5,marginBottom:10},
+  toggleBtn:{width:"100%",border:"1px solid",borderRadius:12,padding:"12px 14px",display:"flex",alignItems:"center",gap:10,marginBottom:8,cursor:"pointer"},
+  slider:   {width:"100%",accentColor:"#7ec8a4"},
+  textarea: {width:"100%",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px",color:"#e8e6df",fontSize:13,lineHeight:1.7,height:72},
+  saveBtn:  {width:"100%",background:"rgba(126,200,164,0.12)",border:"1.5px solid #7ec8a4",borderRadius:14,padding:"16px",color:"#7ec8a4",fontSize:15,fontWeight:700,cursor:"pointer"},
+  tabBar:   {position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:"rgba(10,12,10,0.96)",backdropFilter:"blur(24px)",borderTop:"1px solid rgba(255,255,255,0.07)",display:"flex",padding:"10px 0 24px",zIndex:100},
+  tab:      {flex:1,background:"transparent",border:"none",display:"flex",flexDirection:"column",alignItems:"center",gap:3,position:"relative"},
+  tabLine:  {position:"absolute",bottom:0,left:"50%",transform:"translateX(-50%)",width:20,height:2,background:"#7ec8a4",borderRadius:99},
+  toast:    {position:"fixed",top:28,left:"50%",transform:"translateX(-50%)",background:"rgba(14,18,14,0.97)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:99,padding:"9px 20px",fontSize:13,color:"#e8e6df",backdropFilter:"blur(20px)",zIndex:9999,whiteSpace:"nowrap",animation:"fu 0.25s ease",boxShadow:"0 4px 24px rgba(0,0,0,0.5)"},
+};
+
+function App() {
+  const [page,       setPage]      = useState("home");
+  const [log,        setLog]       = useState([]);
+  const [recs,       setRecs]      = useState({});
+  const [bac,        setBac]       = useState(0);
+  const [maxBac,     setMaxBac]    = useState(0);
+  const [stopped,    setStopped]   = useState(false);
+  const [now,        setNow]       = useState(Date.now());
+  const [streak,     setStreak]    = useState(0);
+  const [voiceOn,    setVoiceOn]   = useState(true);
+  const [profile,    setProfile]   = useState({ weight:70, gender:"male" });
+  const [showProf,   setShowProf]  = useState(false);
+  const [empty,      setEmpty]     = useState(true);
+  const [lastLv,     setLastLv]    = useState(-1);
+  const [habitMsg,   setHabitMsg]  = useState(null);
+  const [toast,      setToast]     = useState(null);
+  const [reviewDate, setReviewDate]= useState(null);
+  const [draft,      setDraft]     = useState(INIT_REVIEW);
+  const [cond,       setCond]      = useState(null);
+  const [showCond,   setShowCond]  = useState(false);
+  const [condDraft,  setCondDraft] = useState(INIT_COND);
+  const tRef = useRef(null);
+
+  const today = getToday(), yesterday = getYesterday(), week = getWeek();
+
+  useEffect(()=>{ const iv=setInterval(()=>setNow(Date.now()),30000); return()=>clearInterval(iv); },[]);
+
+  const cf = condFactor(cond);
+
+  useEffect(()=>{
+    const b = calcBAC(log, profile, now, empty, cf);
+    setBac(b); setMaxBac(p=>Math.max(p,b));
+  },[log,profile,now,empty,cond]);
+
+  useEffect(()=>{
+    const r=localStorage.getItem("sj10_r"), p=localStorage.getItem("sj10_p"), v=localStorage.getItem("sj10_v");
+    const parsed = r ? JSON.parse(r) : {};
+    setRecs(parsed);
+    if(p) setProfile(JSON.parse(p));
+    if(v!==null) setVoiceOn(v==="1");
+    const tr = parsed[today];
+    if(tr){ setLog(tr.log||[]); setStopped(tr.stopped||false); setMaxBac(tr.maxBac||0); if(tr.empty!==undefined)setEmpty(tr.empty); if(tr.cond){setCond(tr.cond);setCondDraft(tr.cond);} }
+    if(!tr?.cond) setShowCond(true);
+  },[]);
+
+  useEffect(()=>{
+    let s=0;
+    for(let i=0;i<365;i++){ const d=new Date(); d.setDate(d.getDate()-i); const k=d.toISOString().split("T")[0]; if(!(recs[k]||{}).blackout)s++; else break; }
+    setStreak(s);
+  },[recs]);
+
+  useEffect(()=>{
+    const stage=getStage(bac);
+    if(stage.lv>lastLv&&voiceOn&&log.length>0){ const sesMin=(now-(log[0]?.time||now))/60000; speak(voiceMsg(bac,stage,log.length,sesMin>90,cf)); setLastLv(stage.lv); }
+  },[bac]);
+
+  useEffect(()=>{
+    if(!log.length){setHabitMsg(null);return;}
+    const sesMin=(now-(log[0]?.time||now))/60000;
+    const rate=sesMin>5?log.length/(sesMin/60):null;
+    if(rate&&rate>2.5){setHabitMsg({t:"speed",m:"빠르게 마시고 있어 성재.\n안주도 없으면 BAC가 훨씬 빨리 오른다."});return;}
+    if(sesMin>90&&log.length>2){setHabitMsg({t:"2nd",m:"2차야. 이미 BAC 올라간 상태에서\n추가로 마시면 블랙아웃 확률 급등해."});return;}
+    setHabitMsg(null);
+  },[log,now]);
+
+  function persist(nl, extra={}) {
+    const rec={log:nl,maxBac,empty,cond,...extra};
+    const updated={...recs,[today]:rec};
+    setRecs(updated); localStorage.setItem("sj10_r",JSON.stringify(updated));
+  }
+  function persistDate(date,rec) {
+    const updated={...recs,[date]:rec};
+    setRecs(updated); localStorage.setItem("sj10_r",JSON.stringify(updated));
+  }
+  function saveCond() {
+    setCond(condDraft); persist(log,{stopped,blackout:(recs[today]||{}).blackout,cond:condDraft}); setShowCond(false);
+    const f=condFactor(condDraft);
+    if(f>1.1&&voiceOn) speak(`오늘 컨디션 보정 ${f.toFixed(2)}배 적용됐어. 같은 양 마셔도 더 취하는 상태야. 조심해 성재.`);
+    showT(f>1.0?`컨디션 보정 ×${f.toFixed(2)} 적용됨`:"컨디션 입력 완료 ✓");
+  }
+  function exportData() {
+    const data={version:1,exportedAt:new Date().toISOString(),recs,profile,voiceOn};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a"); a.href=url; a.download=`성재_절주앱_백업_${today}.json`; a.click();
+    URL.revokeObjectURL(url); showT("백업 파일 저장됨 💾");
+  }
+  function importData(e) {
+    const file=e.target.files?.[0]; if(!file)return;
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      try {
+        const data=JSON.parse(ev.target.result);
+        if(!data.recs) throw new Error();
+        setRecs(data.recs); localStorage.setItem("sj10_r",JSON.stringify(data.recs));
+        if(data.profile){setProfile(data.profile);localStorage.setItem("sj10_p",JSON.stringify(data.profile));}
+        if(data.voiceOn!==undefined){setVoiceOn(data.voiceOn);localStorage.setItem("sj10_v",data.voiceOn?"1":"0");}
+        const tr=data.recs[today];
+        if(tr){setLog(tr.log||[]);setStopped(tr.stopped||false);setMaxBac(tr.maxBac||0);if(tr.cond){setCond(tr.cond);setCondDraft(tr.cond);}}
+        showT(`데이터 복원 완료 ✅ (${Object.keys(data.recs).length}일치)`);
+      } catch(err){ showT("파일 오류 — 올바른 백업 파일인지 확인해줘"); }
+    };
+    reader.readAsText(file); e.target.value="";
+  }
+  function addDrink(d) {
+    if(stopped){showT("오늘 멈추기로 했잖아 💪");if(voiceOn)speak("성재야 오늘 멈추기로 했잖아.");return;}
+    const nl=[...log,{time:Date.now(),emoji:d.emoji,label:d.label,g:d.g}];
+    setLog(nl); persist(nl,{stopped,blackout:(recs[today]||{}).blackout}); showT(`${d.emoji} 기록됨`);
+  }
+  function undo() { if(!log.length)return; const nl=log.slice(0,-1); setLog(nl); persist(nl,{stopped:false,blackout:(recs[today]||{}).blackout}); setStopped(false); showT("취소 👍"); }
+  function stop() { setStopped(true); persist(log,{stopped:true,blackout:(recs[today]||{}).blackout}); if(voiceOn)speak(`잘했어 성재. 오늘 ${log.length}잔에서 멈췄어.`); showT("잘했어, 성재 ✋"); }
+  function markBO(val) { persist(log,{stopped,blackout:val}); if(voiceOn&&!val)speak("블랙아웃 없이 끝냈어. 잘했어 성재."); showT(val?"기록했어. 내일 아침에 후기 남겨줘":"블랙아웃 없이 끝냈네! 🎉"); }
+  function toggleVoice() { const n=!voiceOn; setVoiceOn(n); localStorage.setItem("sj10_v",n?"1":"0"); if(n)speak("음성 알림 켜졌어."); }
+  function showT(m) { if(tRef.current)clearTimeout(tRef.current); setToast(m); tRef.current=setTimeout(()=>setToast(null),2200); }
+  function openReview(date) { const rec=recs[date]||{}; setDraft(rec.review?{...INIT_REVIEW,...rec.review}:INIT_REVIEW); setReviewDate(date); }
+  function saveReview() { const rec=recs[reviewDate]||{}; persistDate(reviewDate,{...rec,review:draft}); setReviewDate(null); showT("후기 저장! 데이터 반영 완료 ✅"); }
+
+  const stage=getStage(bac), soberH=bac/METABOLISM, totalG=log.reduce((s,e)=>s+e.g,0);
+  const sesMin=log.length>0?(now-log[0].time)/60000:0;
+  const rateH=sesMin>5?(log.length/(sesMin/60)).toFixed(1):null;
+  const is2nd=sesMin>90&&log.length>0, bacPct=Math.min(bac/0.12*100,100);
+  const todayRec=recs[today]||{}, needRev=recs[yesterday]&&(recs[yesterday].log||[]).length>0&&!recs[yesterday].review;
+  const ins=buildInsights(recs), preds=predictNextDay(maxBac,totalG,empty,ins);
+  const weekBO=week.filter(d=>(recs[d]||{}).blackout).length, allRecs=Object.values(recs);
+
+  // 컨디션 입력 화면
+  if (showCond) {
+    const pf = condFactor(condDraft);
+    return (
+      <div style={S.root}>
+        <div style={S.pg}>
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:16,fontWeight:700,marginBottom:4}}>🩺 오늘 컨디션 체크</div>
+            <div style={{fontSize:12,color:"#6b7280",lineHeight:1.7}}>컨디션에 따라 BAC 계산에 보정이 적용돼요.<br/>같은 양을 마셔도 오늘 상태에 따라 더 취할 수 있어요.</div>
+          </div>
+          <div style={S.condSec}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={S.condLabel}>😴 어젯밤 수면 시간</div>
+              <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:20,fontWeight:700,color:condDraft.sleep<=4?"#e05c5c":condDraft.sleep<=6?"#e8c44a":"#7ec8a4"}}>{condDraft.sleep}시간</div>
+            </div>
+            <input type="range" min="2" max="12" step="0.5" value={condDraft.sleep} onChange={e=>setCondDraft(d=>({...d,sleep:+e.target.value}))} style={S.slider}/>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#4b5563"}}><span style={{color:"#e05c5c"}}>2h 심각</span><span>6h 부족</span><span style={{color:"#7ec8a4"}}>8h+ 충분</span></div>
+            {condDraft.sleep<=4&&<div style={S.condWarnTxt}>⚠️ 수면 부족 — BAC ×1.20 보정</div>}
+            {condDraft.sleep>4&&condDraft.sleep<=6&&<div style={S.condWarnTxt}>수면 부족 — BAC ×1.10 보정</div>}
+          </div>
+          <div style={S.condSec}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={S.condLabel}>😤 스트레스 레벨</div>
+              <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:20,fontWeight:700,color:condDraft.stress>=4?"#e05c5c":condDraft.stress>=3?"#e8c44a":"#7ec8a4"}}>{condDraft.stress}/5</div>
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              {[1,2,3,4,5].map(v=>(
+                <button key={v} onClick={()=>setCondDraft(d=>({...d,stress:v}))}
+                  style={{flex:1,border:`1.5px solid ${condDraft.stress>=v?(v>=4?"#e05c5c":v>=3?"#e8c44a":"#7ec8a4"):"rgba(255,255,255,0.1)"}`,borderRadius:10,padding:"10px 0",
+                    background:condDraft.stress>=v?(v>=4?"#e05c5c":v>=3?"#e8c44a":"#7ec8a4")+"22":"transparent",
+                    color:condDraft.stress>=v?(v>=4?"#e05c5c":v>=3?"#e8c44a":"#7ec8a4"):"#6b7280",fontWeight:700,fontSize:14}}>{v}</button>
+              ))}
+            </div>
+            {condDraft.stress>=4&&<div style={S.condWarnTxt}>⚠️ 스트레스 높음 — BAC ×1.10 보정</div>}
+            {condDraft.stress===3&&<div style={S.condWarnTxt}>스트레스 중간 — BAC ×1.05 보정</div>}
+          </div>
+          <div style={S.condSec}>
+            <div style={S.condLabel}>기타 상태</div>
+            {[{k:"dehydrated",label:"💧 탈수 상태 (물을 별로 못 마셨어)",warn:"BAC ×1.15 보정"},{k:"sick",label:"🤒 몸 상태 안 좋음 (감기, 피로 등)",warn:"BAC ×1.15 보정"}].map(item=>(
+              <button key={item.k} onClick={()=>setCondDraft(d=>({...d,[item.k]:!d[item.k]}))}
+                style={{...S.toggleBtn,borderColor:condDraft[item.k]?"#e8944a":"rgba(255,255,255,0.08)",background:condDraft[item.k]?"rgba(232,148,74,0.1)":"rgba(255,255,255,0.03)",color:condDraft[item.k]?"#e8944a":"#9ca3af"}}>
+                <span style={{fontSize:17}}>{condDraft[item.k]?"✅":"⬜"}</span>
+                <div style={{flex:1,textAlign:"left"}}>
+                  <div style={{fontSize:13,fontWeight:600}}>{item.label}</div>
+                  {condDraft[item.k]&&<div style={{fontSize:10,color:"#e8944a",marginTop:2}}>{item.warn}</div>}
+                </div>
+              </button>
+            ))}
+          </div>
+          <div style={{padding:"14px 16px",borderRadius:16,border:`1.5px solid ${pf>1.15?"#e05c5c55":pf>1.05?"#e8c44a55":"rgba(126,200,164,0.3)"}`,background:pf>1.15?"rgba(224,92,92,0.07)":pf>1.05?"rgba(232,196,74,0.07)":"rgba(126,200,164,0.07)",marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:12,color:"#9ca3af"}}>오늘 BAC 보정 계수</div>
+              <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:26,fontWeight:700,color:pf>1.15?"#e05c5c":pf>1.05?"#e8c44a":"#7ec8a4"}}>×{pf.toFixed(2)}</div>
+            </div>
+            <div style={{fontSize:11,color:"#6b7280",marginTop:6,lineHeight:1.7}}>
+              {pf<=1.0&&"오늘 컨디션 양호. 정상 BAC 계산 적용."}
+              {pf>1.0&&pf<=1.10&&"컨디션 약간 저하. 같은 양 마셔도 조금 더 취해."}
+              {pf>1.10&&pf<=1.20&&"컨디션 저하. 평소보다 적은 양에서 경고 구간 도달해."}
+              {pf>1.20&&"컨디션 많이 안 좋아. 오늘은 진짜 조심해야 해, 성재."}
+            </div>
+          </div>
+          <button onClick={saveCond} style={S.saveBtn}>확인 — 오늘 모니터링 시작</button>
+          <button onClick={()=>{setCond(INIT_COND);setShowCond(false);}} style={{width:"100%",background:"transparent",border:"none",color:"#4b5563",fontSize:12,padding:"10px",marginTop:4}}>건너뛰기 (기본값 적용)</button>
+        </div>
+      </div>
+    );
+  }
+
+  // 후기 화면
+  if (reviewDate) {
+    const rec=recs[reviewDate]||{};
+    return (
+      <div style={S.root}>
+        <div style={S.pg}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+            <button onClick={()=>setReviewDate(null)} style={{background:"transparent",border:"none",color:"#9ca3af",fontSize:20}}>←</button>
+            <div>
+              <div style={{fontSize:16,fontWeight:700}}>📝 {reviewDate} 후기</div>
+              <div style={{fontSize:11,color:"#6b7280",marginTop:2}}>{(rec.log||[]).length}잔 · 최고 BAC {(rec.maxBac||0).toFixed(3)}{rec.cond&&` · 보정 ×${condFactor(rec.cond).toFixed(2)}`}{rec.blackout?" · 블랙아웃 💀":" · 기억 있음 ✓"}</div>
+            </div>
+          </div>
+          <div style={S.revSec}>
+            <div style={S.revLabel}>숙취 강도</div>
+            <div style={{display:"flex",gap:8,marginBottom:6}}>
+              {[0,1,2,3,4,5].map(v=>{ const active=draft.hangover===v; const col=v>=4?"#e05c5c":v>=3?"#e8944a":v>=2?"#e8c44a":v>=1?"#a8d882":"#7ec8a4"; return(<button key={v} onClick={()=>setDraft(d=>({...d,hangover:v}))} style={{flex:1,border:`1.5px solid ${active?col:"rgba(255,255,255,0.1)"}`,borderRadius:10,padding:"10px 0",background:active?col+"22":"transparent",color:active?col:"#6b7280",fontWeight:700,fontSize:15}}>{v}</button>); })}
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#4b5563"}}><span>없음</span><span>가벼움</span><span>보통</span><span>심함</span><span>극심</span></div>
+          </div>
+          <div style={S.revSec}>
+            <div style={S.revLabel}>증상</div>
+            {[{k:"headache",label:"두통",icon:"🤕"},{k:"nausea",label:"메스꺼움 / 구토",icon:"🤢"},{k:"regret",label:"후회했음",icon:"😔"}].map(item=>(
+              <button key={item.k} onClick={()=>setDraft(d=>({...d,[item.k]:!d[item.k]}))}
+                style={{...S.toggleBtn,borderColor:draft[item.k]?"#7ec8a4":"rgba(255,255,255,0.08)",background:draft[item.k]?"rgba(126,200,164,0.12)":"rgba(255,255,255,0.03)",color:draft[item.k]?"#7ec8a4":"#9ca3af"}}>
+                <span style={{fontSize:18}}>{item.icon}</span>
+                <span style={{fontSize:13,fontWeight:600}}>{item.label}</span>
+                <span style={{marginLeft:"auto",fontSize:16}}>{draft[item.k]?"✅":"○"}</span>
+              </button>
+            ))}
+          </div>
+          <div style={S.revSec}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={S.revLabel}>기억 선명도</div><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:18,fontWeight:700,color:draft.memory<=3?"#e05c5c":draft.memory<=6?"#e8c44a":"#7ec8a4"}}>{draft.memory}/10</div></div>
+            <input type="range" min="0" max="10" value={draft.memory} onChange={e=>setDraft(d=>({...d,memory:+e.target.value}))} style={S.slider}/>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#4b5563"}}><span>블랙아웃 (0)</span><span>흐릿 (5)</span><span>선명 (10)</span></div>
+          </div>
+          <div style={S.revSec}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={S.revLabel}>다음날 컨디션 / 집중도</div><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:18,fontWeight:700,color:draft.focus<=3?"#e05c5c":draft.focus<=6?"#e8c44a":"#7ec8a4"}}>{draft.focus}/10</div></div>
+            <input type="range" min="0" max="10" value={draft.focus} onChange={e=>setDraft(d=>({...d,focus:+e.target.value}))} style={S.slider}/>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#4b5563"}}><span>최악 (0)</span><span>보통 (5)</span><span>최고 (10)</span></div>
+          </div>
+          <div style={S.revSec}>
+            <div style={S.revLabel}>한 줄 메모 (선택)</div>
+            <textarea value={draft.memo} onChange={e=>setDraft(d=>({...d,memo:e.target.value}))} placeholder="오늘 어떤 하루였어? 후회, 느낌, 특이사항..." style={S.textarea}/>
+          </div>
+          <button onClick={saveReview} style={S.saveBtn}>저장 — 성재 데이터에 반영 ✅</button>
+        </div>
+      </div>
+    );
+  }
+
+  // 메인 UI
+  return (
+    <div style={S.root}>
+      <div style={{...S.orb,background:`radial-gradient(ellipse,${stage.col}1e 0%,transparent 65%)`,transition:"background 1.5s"}}/>
+
+      {page==="home"&&(
+        <div style={S.pg}>
+          <div style={S.hdr}>
+            <div><div style={S.hdrT}>성재 BAC Monitor</div><div style={S.hdrS}>{today} · {DAY[new Date().getDay()]}요일</div></div>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={toggleVoice} style={{...S.iconBtn,color:voiceOn?"#7ec8a4":"#4b5563",borderColor:voiceOn?"#7ec8a455":"rgba(255,255,255,0.08)"}}>{voiceOn?"🔊":"🔇"}</button>
+              <button onClick={()=>setShowCond(true)} style={{...S.iconBtn,color:cf>1.1?"#e8944a":"#9ca3af",borderColor:cf>1.1?"#e8944a55":"rgba(255,255,255,0.08)"}}>🩺</button>
+              <button onClick={()=>setShowProf(p=>!p)} style={{...S.iconBtn,color:"#9ca3af",borderColor:"rgba(255,255,255,0.08)"}}>⚙️</button>
+            </div>
+          </div>
+
+          {cf>1.0&&(
+            <button onClick={()=>setShowCond(true)} style={{...S.condBanner,borderColor:cf>1.2?"#e05c5c55":cf>1.1?"#e8944a55":"#e8c44a55",background:cf>1.2?"rgba(224,92,92,0.07)":cf>1.1?"rgba(232,148,74,0.07)":"rgba(232,196,74,0.07)"}}>
+              <div style={{fontSize:15}}>🩺</div>
+              <div style={{flex:1,textAlign:"left"}}>
+                <div style={{fontSize:12,fontWeight:700,color:cf>1.2?"#e05c5c":cf>1.1?"#e8944a":"#e8c44a"}}>컨디션 보정 ×{cf.toFixed(2)} 적용 중</div>
+                <div style={{fontSize:10,color:"#6b7280",marginTop:2}}>{cond?.sleep<=4?"수면 부족 ":cond?.sleep<=6?"수면 부족 ":""}{cond?.stress>=4?"고스트레스 ":cond?.stress>=3?"스트레스 ":""}{cond?.dehydrated?"탈수 ":""}{cond?.sick?"몸 상태 불량":""} — 탭해서 수정</div>
+              </div>
+              <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:18,fontWeight:700,color:cf>1.2?"#e05c5c":cf>1.1?"#e8944a":"#e8c44a"}}>×{cf.toFixed(2)}</div>
+            </button>
+          )}
+
+          {needRev&&(
+            <button onClick={()=>openReview(yesterday)} style={S.reviewNudge}>
+              <div style={{fontSize:18}}>📝</div>
+              <div style={{flex:1,textAlign:"left"}}>
+                <div style={{fontSize:13,fontWeight:700,color:"#a78bfa"}}>어제 후기 남겨줘</div>
+                <div style={{fontSize:11,color:"#6b7280",marginTop:2}}>{ins.ready?`성재 기준 예측 중 (${ins.count}회)`:`후기 ${Math.max(0,3-ins.count)}개 더 쌓이면 개인화 시작`}</div>
+              </div>
+              <div style={{color:"#a78bfa",fontSize:14}}>→</div>
+            </button>
+          )}
+
+          <div style={S.tolBanner}>
+            <span style={{fontSize:13}}>⚠️</span>
+            <span style={{fontSize:11,color:"#e8c44a",lineHeight:1.6}}><strong>금주 후 내성 저하</strong> — 소주 1병도 알딸딸. 이전 주량 기준으로 마시면 블랙아웃 거의 확실</span>
+          </div>
+
+          {showProf&&(
+            <div style={S.profCard}>
+              <div style={{fontSize:11,color:"#6b7280",marginBottom:10,fontWeight:600}}>신체 정보 (BAC 정확도)</div>
+              <div style={{display:"flex",gap:10,marginBottom:10}}>
+                <div style={{flex:1}}><div style={S.pLab}>체중 (kg)</div><input type="number" value={profile.weight} onChange={e=>{const p={...profile,weight:+e.target.value};setProfile(p);localStorage.setItem("sj10_p",JSON.stringify(p));}} style={S.pInput}/></div>
+                <div style={{flex:1}}><div style={S.pLab}>성별</div><div style={{display:"flex",gap:6}}>{["male","female"].map(g=>(<button key={g} onClick={()=>{const p={...profile,gender:g};setProfile(p);localStorage.setItem("sj10_p",JSON.stringify(p));}} style={{...S.gBtn,borderColor:profile.gender===g?"#7ec8a4":"rgba(255,255,255,0.1)",color:profile.gender===g?"#7ec8a4":"#9ca3af"}}>{g==="male"?"남":"여"}</button>))}</div></div>
+              </div>
+              <div style={S.pLab}>안주 상태</div>
+              <div style={{display:"flex",gap:8}}>
+                {[{v:true,l:"공복"},{v:false,l:"안주 있음"}].map(x=>(<button key={String(x.v)} onClick={()=>{setEmpty(x.v);persist(log,{stopped,blackout:todayRec.blackout,empty:x.v});}} style={{...S.gBtn,flex:1,borderColor:empty===x.v?"#e8c44a":"rgba(255,255,255,0.1)",color:empty===x.v?"#e8c44a":"#9ca3af",fontSize:12}}>{x.l}</button>))}
+              </div>
+              <div style={{marginTop:14,paddingTop:14,borderTop:"1px solid rgba(255,255,255,0.06)"}}>
+                <div style={S.pLab}>데이터 백업</div>
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={exportData} style={{flex:1,background:"rgba(126,200,164,0.08)",border:"1px solid rgba(126,200,164,0.3)",borderRadius:10,padding:"10px 6px",color:"#7ec8a4",fontSize:12,fontWeight:600}}>💾 내보내기</button>
+                  <label style={{flex:1,background:"rgba(167,139,250,0.08)",border:"1px solid rgba(167,139,250,0.3)",borderRadius:10,padding:"10px 6px",color:"#a78bfa",fontSize:12,fontWeight:600,textAlign:"center",display:"block"}}>
+                    📂 가져오기<input type="file" accept=".json" onChange={importData} style={{display:"none"}}/>
+                  </label>
+                </div>
+                <div style={{fontSize:10,color:"#4b5563",marginTop:6,lineHeight:1.6}}>폰 바꿀 때 내보내기 → 새 파일 저장 후 가져오기</div>
+              </div>
+            </div>
+          )}
+
+          {habitMsg&&(
+            <div style={{...S.habitBanner,borderColor:habitMsg.t==="2nd"?"#e05c5c55":"#e8944a55",background:habitMsg.t==="2nd"?"rgba(224,92,92,0.07)":"rgba(232,148,74,0.07)"}}>
+              <div style={{fontSize:15}}>{habitMsg.t==="2nd"?"🔄":"⚡"}</div>
+              <div style={{fontSize:12,color:"#d1d5db",lineHeight:1.7,whiteSpace:"pre-line"}}>{habitMsg.m}</div>
+            </div>
+          )}
+
+          <div style={{...S.bacCard,borderColor:stage.col+"50",background:`linear-gradient(135deg,rgba(255,255,255,0.03),${stage.col}0d)`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:10,color:"#6b7280",letterSpacing:1.5,textTransform:"uppercase",marginBottom:4}}>혈중 알코올 농도</div>
+                <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:44,fontWeight:700,color:stage.col,lineHeight:1}}>{bac.toFixed(3)}<span style={{fontSize:14,color:"#6b7280",marginLeft:4}}>%</span></div>
+                <div style={{display:"flex",gap:6,marginTop:4,flexWrap:"wrap"}}>
+                  {empty&&bac>0.01&&<div style={{fontSize:10,color:"#e8c44a"}}>⚡ 공복 +25%</div>}
+                  {cf>1.0&&<div style={{fontSize:10,color:cf>1.15?"#e05c5c":"#e8944a"}}>🩺 컨디션 ×{cf.toFixed(2)}</div>}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{...S.stageBadge,background:stage.col+"22",borderColor:stage.col+"55",color:stage.col}}>{stage.label}</div>
+                {log.length>0&&<div style={{fontSize:10,color:"#6b7280",marginTop:5}}>{fmtMs(sesMin*60000)} 경과</div>}
+                {is2nd&&<div style={{fontSize:10,color:"#e05c5c",marginTop:2}}>🔄 2차 구간</div>}
+              </div>
+            </div>
+            <div style={{position:"relative",marginBottom:6}}>
+              <div style={{background:"rgba(255,255,255,0.07)",borderRadius:99,height:8,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${bacPct}%`,background:`linear-gradient(to right,#7ec8a4,${stage.col})`,borderRadius:99,transition:"width 0.8s"}}/>
+              </div>
+              {[{v:0.05,c:"#e8c44a"},{v:0.08,c:"#e8944a"},{v:0.10,c:"#e05c5c"}].map((m,i)=>(<div key={i} style={{position:"absolute",top:-3,left:`${m.v/0.12*100}%`,width:2,height:14,background:m.c,borderRadius:99,opacity:0.8}}/>))}
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#4b5563",marginBottom:12}}><span>안전</span><span style={{color:"#e8c44a"}}>0.05</span><span style={{color:"#e8944a"}}>0.08</span><span style={{color:"#e05c5c"}}>0.10 블랙아웃</span></div>
+            <div style={{display:"flex",gap:7}}>
+              {[{l:"완전히 깰 때",v:soberH>0?fmtSober(soberH):"이미 맑음",c:soberH>2?"#e8c44a":"#7ec8a4"},{l:"음주 속도",v:rateH?`${rateH}잔/h`:"-",c:rateH&&parseFloat(rateH)>2?"#e8944a":"#e8e6df"},{l:"순알코올",v:`${totalG}g`,c:"#e8e6df"}].map((x,i)=>(
+                <div key={i} style={S.iBox}><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,fontWeight:700,color:x.c}}>{x.v}</div><div style={{fontSize:9,color:"#6b7280",marginTop:3}}>{x.l}</div></div>
+              ))}
+            </div>
+          </div>
+
+          {(log.length>0||maxBac>0.01)&&(
+            <div style={S.predCard}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <span style={{fontSize:11,fontWeight:700,color:"#9ca3af"}}>🔮 내일 예측</span>
+                <span style={{fontSize:10,color:ins.ready?"#7ec8a4":"#6b7280"}}>{ins.ready?`성재 데이터 ${ins.count}회 ✓`:`일반 기준 (후기 ${Math.max(0,3-ins.count)}개 필요)`}</span>
+              </div>
+              {preds.map((p,i)=>(
+                <div key={i} style={{display:"flex",gap:10,marginBottom:9,alignItems:"flex-start"}}>
+                  <div style={{fontSize:17,flexShrink:0}}>{p.icon}</div>
+                  <div><div style={{fontSize:13,fontWeight:600,color:p.s>=4?"#e05c5c":p.s>=3?"#e8944a":p.s>=2?"#e8c44a":"#7ec8a4"}}>{p.t}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2,lineHeight:1.5}}>{p.d}</div></div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            <button onClick={()=>speak(voiceMsg(bac,stage,log.length,is2nd,cf))} style={{...S.voiceBtn,borderColor:"#7ec8a455",color:"#7ec8a4",flex:2}}>🔊 현재 상태 음성으로 듣기</button>
+            <button onClick={toggleVoice} style={{...S.voiceBtn,borderColor:voiceOn?"#7ec8a455":"rgba(255,255,255,0.1)",color:voiceOn?"#7ec8a4":"#4b5563",flex:1}}>{voiceOn?"자동 ON":"자동 OFF"}</button>
+          </div>
+
+          {!stopped?(
+            <button onClick={stop} style={{...S.stopBtn,borderColor:stage.col,color:stage.col,background:stage.lv>=3?stage.col+"1a":"transparent",padding:stage.lv>=3?"17px":"13px",fontSize:stage.lv>=3?16:14}}>
+              {stage.lv>=4?"🚨 지금 당장 멈춰, 성재":stage.lv>=3?"🛑 여기서 멈추기":"✋ 오늘은 여기서 끝"}
+            </button>
+          ):(
+            <div style={S.stoppedBox}><div style={{fontSize:20}}>✅</div><div><div style={{fontSize:14,fontWeight:700,color:"#7ec8a4"}}>BAC {bac.toFixed(3)}에서 멈췄어</div><div style={{fontSize:12,color:"#6b7280",marginTop:2}}>내일 아침에 후기 남겨줘 📝</div></div></div>
+          )}
+
+          {!stopped&&(
+            <>
+              <div style={S.secLab}>마신 술 기록</div>
+              <div style={S.dGrid}>
+                {DRINKS.map(d=>(<button key={d.id} onClick={()=>addDrink(d)} style={S.dBtn}><div style={{fontSize:22}}>{d.emoji}</div><div style={{fontSize:10,color:"#9ca3af",marginTop:3}}>{d.label}</div><div style={{fontSize:9,color:"#6b7280"}}>{d.ml}cc</div><div style={{fontSize:9,color:"#4b5563"}}>{d.g}g</div></button>))}
+              </div>
+              <button onClick={undo} style={S.undoBtn}>← 마지막 기록 취소</button>
+            </>
+          )}
+
+          {log.length>0&&(
+            <div style={{marginBottom:12}}>
+              <div style={S.secLab}>오늘 타임라인</div>
+              {log.map((h,i)=>{
+                const elH=(now-h.time)/3600000,absH=Math.max(0,elH-0.3);
+                const peak=(h.g*100*(empty?EMPTY_FACTOR:1)*cf)/(profile.weight*R[profile.gender]*1000);
+                const rem=Math.max(0,peak-METABOLISM*absH);
+                return(<div key={i} style={S.tlRow}><div style={{fontSize:18}}>{h.emoji}</div><div style={{flex:1}}><div style={{fontSize:12,color:"#d1d5db"}}>{h.label}<span style={{color:"#4b5563",marginLeft:4}}>({h.g}g)</span></div><div style={{fontSize:10,color:"#6b7280"}}>{fmtMs(now-h.time)} 전</div></div><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:rem>0.005?"#e8c44a":"#7ec8a4"}}>{rem>0?`+${rem.toFixed(3)}`:"분해됨"}</div></div>);
+              })}
+            </div>
+          )}
+
+          {log.length>0&&(
+            <div style={S.checkCard}>
+              <div style={{fontSize:12,color:"#9ca3af",marginBottom:10}}>오늘 마무리 기록</div>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>markBO(false)} style={{...S.checkBtn,borderColor:todayRec.blackout===false?"#7ec8a4":"rgba(255,255,255,0.1)",color:todayRec.blackout===false?"#7ec8a4":"#9ca3af"}}>기억 있어 ✓</button>
+                <button onClick={()=>markBO(true)} style={{...S.checkBtn,borderColor:todayRec.blackout===true?"#e05c5c":"rgba(255,255,255,0.1)",color:todayRec.blackout===true?"#e05c5c":"#9ca3af"}}>블랙아웃 💀</button>
+              </div>
+            </div>
+          )}
+
+          <div style={S.weekRow}>
+            {week.map(d=>{ const r=recs[d]||{},iT=d===today,bo=r.blackout,c=(r.log||[]).length,hasRev=!!r.review; const col=bo?"#e05c5c":c>0?"#e8c44a":"#7ec8a4"; return(<button key={d} onClick={()=>c>0&&openReview(d)} style={{...S.dot,background:iT?col+"2a":col+"12",border:`2px solid ${iT?col:"transparent"}`}}><div style={{fontSize:9,color:iT?"#e8e6df":"#6b7280"}}>{DAY[new Date(d).getDay()]}</div><div style={{fontSize:11,fontWeight:700,marginTop:2,color:col}}>{bo?"💀":c>0?c:"✓"}</div>{c>0&&<div style={{fontSize:8,color:hasRev?"#7ec8a4":"#4b5563",marginTop:1}}>{hasRev?"📝":"○"}</div>}</button>); })}
+          </div>
+          <div style={{fontSize:10,color:"#4b5563",textAlign:"center",marginTop:6}}>날짜 탭하면 후기 입력 가능</div>
+        </div>
+      )}
+
+      {page==="calendar"&&(
+        <div style={S.pg}>
+          <div style={S.pgT}>📅 음주 기록</div>
+          <div style={S.statRow}>
+            {[{v:`${week.filter(d=>(recs[d]||{}).log?.length>0).length}회`,l:"이번 주 음주",c:"#e8c44a"},{v:`${weekBO}번`,l:"블랙아웃",c:weekBO>0?"#e05c5c":"#7ec8a4"},{v:`${streak}일`,l:"연속 클린",c:"#7ec8a4"}].map((x,i)=>(<div key={i} style={S.sBox}><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:22,fontWeight:700,color:x.c}}>{x.v}</div><div style={{fontSize:10,color:"#6b7280",marginTop:3}}>{x.l}</div></div>))}
+          </div>
+          {week.slice().reverse().map(date=>{
+            const r=recs[date]||{},lg=r.log||[],bo=r.blackout,iT=date===today,mxB=r.maxBac||0,hasRev=!!r.review;
+            const col=bo?"#e05c5c":lg.length>0?getStage(mxB).col:"#7ec8a4";
+            const lbl=bo?"블랙아웃 💀":r.stopped?`${lg.length}잔에서 멈춤 ✋`:lg.length===0?"안 마심 ✓":`${lg.length}잔`;
+            const rcf=r.cond?condFactor(r.cond):1;
+            return(<div key={date} style={{...S.calRow,background:iT?"rgba(255,255,255,0.05)":"rgba(255,255,255,0.02)",borderLeft:`3px solid ${col}`}}>
+              <div style={{textAlign:"center",minWidth:30}}><div style={{fontSize:10,color:"#6b7280"}}>{DAY[new Date(date).getDay()]}</div><div style={{fontSize:17,fontWeight:700,color:iT?"#fff":"#bbb"}}>{date.split("-")[2]}</div></div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:13,fontWeight:600,color:col,marginBottom:3}}>{lbl}</div>
+                <div style={{display:"flex",gap:8,fontSize:10,color:"#6b7280"}}>{mxB>0&&<span>최고 BAC {mxB.toFixed(3)}</span>}{rcf>1.0&&<span style={{color:"#e8944a"}}>컨디션 ×{rcf.toFixed(2)}</span>}</div>
+                {r.review&&<div style={{fontSize:11,color:"#9ca3af",marginTop:3}}>숙취 {r.review.hangover}/5 · 기억 {r.review.memory}/10 · 집중 {r.review.focus}/10{r.review.memo&&<div style={{color:"#6b7280",marginTop:2,fontStyle:"italic"}}>"{r.review.memo}"</div>}</div>}
+                {lg.length>0&&<div style={{display:"flex",gap:3,marginTop:4,flexWrap:"wrap"}}>{lg.map((h,i)=><span key={i} style={{fontSize:14}}>{h.emoji}</span>)}</div>}
+              </div>
+              {lg.length>0&&<button onClick={()=>openReview(date)} style={{background:hasRev?"rgba(126,200,164,0.1)":"rgba(255,255,255,0.04)",border:`1px solid ${hasRev?"#7ec8a455":"rgba(255,255,255,0.08)"}`,borderRadius:10,padding:"6px 10px",color:hasRev?"#7ec8a4":"#6b7280",fontSize:11,whiteSpace:"nowrap"}}>{hasRev?"📝 수정":"📝 후기"}</button>}
+            </div>);
+          })}
+          <div style={S.achBox}>
+            <div style={{display:"flex",justifyContent:"space-around"}}>
+              {[{v:allRecs.filter(r=>r.blackout).length,l:"총 블랙아웃",c:"#e05c5c"},{v:allRecs.filter(r=>r.stopped).length,l:"스스로 멈춘 날",c:"#7ec8a4"},{v:allRecs.filter(r=>r.review).length,l:"후기 기록",c:"#a78bfa"}].map((x,i)=>(<div key={i} style={{textAlign:"center"}}><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:28,fontWeight:700,color:x.c}}>{x.v}</div><div style={{fontSize:11,color:"#6b7280",marginTop:3}}>{x.l}</div></div>))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {page==="goal"&&(
+        <div style={S.pg}>
+          <div style={S.pgT}>📊 성재 데이터 분석</div>
+          <div style={{...S.insCard,borderColor:ins.ready?"#7ec8a455":"rgba(255,255,255,0.07)"}}>
+            <div style={{fontSize:12,fontWeight:700,color:ins.ready?"#7ec8a4":"#9ca3af",marginBottom:10}}>{ins.ready?"✅ 성재 기준 예측 활성화":"⏳ 개인화 예측 준비 중"}</div>
+            <div style={{display:"flex",gap:8,marginBottom:12}}>
+              {[{v:ins.count,l:"후기 누적",c:"#a78bfa"},{v:ins.ready?ins.headacheRate+"%":"—",l:"두통 확률",c:ins.ready?"#e8c44a":"#4b5563"},{v:ins.ready?ins.regretRate+"%":"—",l:"후회 확률",c:ins.ready?"#e8944a":"#4b5563"}].map((x,i)=>(<div key={i} style={S.iBox}><div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:16,fontWeight:700,color:x.c}}>{x.v}</div><div style={{fontSize:9,color:"#6b7280",marginTop:3}}>{x.l}</div></div>))}
+            </div>
+            {ins.ready&&(<>{[{label:"0.00–0.05",val:ins.avgLow,col:"#7ec8a4"},{label:"0.05–0.08",val:ins.avgMid,col:"#e8c44a"},{label:"0.08+",val:ins.avgHigh,col:"#e05c5c"}].map((x,i)=>(<div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7}}><div style={{width:8,height:8,borderRadius:"50%",background:x.col,flexShrink:0}}/><div style={{fontSize:11,color:"#9ca3af",flex:1}}>BAC {x.label}</div><div style={{fontSize:13,fontWeight:700,color:x.col}}>{x.val!==null?x.val.toFixed(1)+"/5":"데이터 부족"}</div></div>))}</>)}
+            {!ins.ready&&<div style={{fontSize:12,color:"#6b7280",lineHeight:1.7}}>후기 {Math.max(0,3-ins.count)}개 더 쌓이면 성재 개인 데이터 기반 예측이 시작돼.</div>}
+          </div>
+          <div style={S.insCard}>
+            <div style={{fontSize:11,fontWeight:700,color:"#5dade2",marginBottom:12}}>🩺 컨디션 보정 원리</div>
+            {[{icon:"😴",t:"수면 부족 ×1.10~1.20",d:"간 기능 저하 + 뇌가 알코올에 더 민감해짐."},{icon:"😤",t:"고스트레스 ×1.05~1.10",d:"코르티솔 분비 → 알코올 흡수 촉진."},{icon:"💧",t:"탈수 ×1.15",d:"혈액 수분 감소 → BAC 농축."},{icon:"🤒",t:"몸 상태 불량 ×1.15",d:"간 처리 속도 저하 → 알코올 분해 지연."}].map((x,i)=>(<div key={i} style={{display:"flex",gap:10,marginBottom:11,alignItems:"flex-start"}}><div style={{fontSize:17,flexShrink:0}}>{x.icon}</div><div><div style={{fontSize:13,fontWeight:600,color:"#e8e6df"}}>{x.t}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2,lineHeight:1.6}}>{x.d}</div></div></div>))}
+          </div>
+          <div style={S.insCard}>
+            <div style={{fontSize:11,fontWeight:700,color:"#e8c44a",marginBottom:12}}>⚠️ 성재 블랙아웃 패턴</div>
+            {[{icon:"📉",t:"내성 저하",d:"금주 후 ADH 효소 활성도 저하. 소주 1병도 알딸딸한 이유."},{icon:"⚡",t:"공복 흡수",d:"안주 없으면 BAC 25% 빠르게 상승."},{icon:"⏱",t:"흡수 지연",d:"마신 후 30분 뒤 BAC 최고점. 갑자기 훅 오는 이유."},{icon:"🔄",t:"2·3차 누적",d:"이미 올라간 BAC에 추가 음주 → 블랙아웃 거의 확정."}].map((x,i)=>(<div key={i} style={{display:"flex",gap:10,marginBottom:11,alignItems:"flex-start"}}><div style={{fontSize:17,flexShrink:0}}>{x.icon}</div><div><div style={{fontSize:13,fontWeight:600,color:"#e8e6df"}}>{x.t}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2,lineHeight:1.6}}>{x.d}</div></div></div>))}
+          </div>
+          <div style={{...S.achBox,textAlign:"center"}}>
+            <div style={{fontSize:10,color:"#6b7280",marginBottom:6}}>블랙아웃 없는 연속일</div>
+            <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:52,fontWeight:700,color:"#7ec8a4"}}>{streak}</div>
+            <div style={{fontSize:13,color:"#d1d5db",marginTop:12,lineHeight:1.9}}>
+              {streak>=30?"🏆 한 달 블랙아웃 없었어. 성재, 진짜 달라진 거야.":streak>=14?"🌟 2주 연속 클린.":streak>=7?"🎉 일주일 블랙아웃 없이.":streak>=3?"🌱 3일 연속 클린. 잘하고 있어.":"오늘부터 다시 시작하면 돼."}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={S.tabBar}>
+        {[{id:"home",ic:"⚗️",lb:"모니터"},{id:"calendar",ic:"📅",lb:"기록"},{id:"goal",ic:"📊",lb:"분석"}].map(t=>(
+          <button key={t.id} onClick={()=>setPage(t.id)} style={{...S.tab,color:page===t.id?"#7ec8a4":"#4b5563"}}>
+            <div style={{fontSize:20}}>{t.ic}</div>
+            <div style={{fontSize:10,fontWeight:page===t.id?700:400}}>{t.lb}</div>
+            {page===t.id&&<div style={S.tabLine}/>}
+          </button>
+        ))}
+      </div>
+
+      {toast&&<div style={S.toast}>{toast}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
